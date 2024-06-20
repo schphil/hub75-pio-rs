@@ -7,8 +7,12 @@ license = "MIT"
 
 [dependencies]
 pio-proc = "0.2"
-pio = "0.2"
+pio = "0.2.1"
 libm = "0.2"
+fixed = "1.23.1"
 
-rp2040-hal = "0.9"
+defmt = "0.3"
+defmt-rtt = "0.4"
 embedded-graphics = "0.8"
+rp-pac = "6.0.0"
+embassy-rp = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl"] }

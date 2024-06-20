@@ -29,16 +29,22 @@
 
 // TODO: Implement the drop trait to release DMA & PIO?
 // TODO: organize these
-use crate::dma::{Channel, ChannelIndex, ChannelRegs};
 use core::convert::TryInto;
-use embedded_graphics::prelude::*;
-use rp2040_hal::gpio::{DynPinId, Function, Pin, PullNone};
-use rp2040_hal::pio::{
-    Buffers, PIOBuilder, PIOExt, PinDir, ShiftDirection, StateMachineIndex, UninitStateMachine, PIO,
+use embassy_rp::dma::Channel;
+use embassy_rp::pac::dma::vals::TreqSel;
+use embassy_rp::peripherals;
+use embassy_rp::pio::{
+    Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
+    StateMachine,
 };
+use embassy_rp::bind_interrupts;
+use embedded_graphics::prelude::*;
 
-pub mod dma;
 pub mod lut;
+
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<peripherals::PIO0>;
+});
 
 /// Framebuffer size in bytes
 #[doc(hidden)]
@@ -140,41 +146,161 @@ where
     }
 }
 
-/// Mapping between GPIO pins and HUB75 pins
-pub struct DisplayPins<F: Function> {
-    pub r1: Pin<DynPinId, F, PullNone>,
-    pub g1: Pin<DynPinId, F, PullNone>,
-    pub b1: Pin<DynPinId, F, PullNone>,
-    pub r2: Pin<DynPinId, F, PullNone>,
-    pub g2: Pin<DynPinId, F, PullNone>,
-    pub b2: Pin<DynPinId, F, PullNone>,
-    pub clk: Pin<DynPinId, F, PullNone>,
-    pub addra: Pin<DynPinId, F, PullNone>,
-    pub addrb: Pin<DynPinId, F, PullNone>,
-    pub addrc: Pin<DynPinId, F, PullNone>,
-    pub addrd: Pin<DynPinId, F, PullNone>,
-    pub lat: Pin<DynPinId, F, PullNone>,
-    pub oe: Pin<DynPinId, F, PullNone>,
-}
-
 /// The HUB75 display driver
 pub struct Display<'a, CH1, const W: usize, const H: usize, const B: usize, C>
 where
     [(); fb_bytes(W, H, B)]: Sized,
-    CH1: ChannelIndex,
+    CH1: Channel,
     C: RgbColor,
 {
     mem: &'static mut DisplayMemory<W, H, B>,
-    fb_loop_ch: Channel<CH1>,
+    fb_loop_ch: CH1,
     benchmark: bool,
     brightness: u8,
     lut: &'a dyn lut::Lut<B, C>,
 }
 
+fn setup_pio_task_data<'a, const W: usize>(
+    pio: &mut embassy_rp::pio::Common<'a, peripherals::PIO0>,
+    sm: &mut StateMachine<'a, peripherals::PIO0, 0>,
+    r1: impl PioPin,
+    g1: impl PioPin,
+    b1: impl PioPin,
+    r2: impl PioPin,
+    g2: impl PioPin,
+    b2: impl PioPin,
+    clk: impl PioPin,
+) {
+    // Data program
+    let prg = pio_proc::pio_asm!(
+        ".side_set 1",
+        "out isr, 32    side 0b0",
+        ".wrap_target",
+        "mov x isr      side 0b0",
+        // Wait for the row program to set the ADDR pins
+        "pixel:",
+        "out pins, 8    side 0b0",
+        "jmp x-- pixel  side 0b1", // clock out the pixel
+        "irq 4          side 0b0", // tell the row program to set the next row
+        "wait 1 irq 5   side 0b0",
+        ".wrap",
+    );
+
+    let r1 = pio.make_pio_pin(r1);
+    let g1 = pio.make_pio_pin(g1);
+    let b1 = pio.make_pio_pin(b1);
+    let r2 = pio.make_pio_pin(r2);
+    let g2 = pio.make_pio_pin(g2);
+    let b2 = pio.make_pio_pin(b2);
+    let clk = pio.make_pio_pin(clk);
+
+    sm.set_pin_dirs(Direction::Out, &[&r1, &g1, &b1, &r2, &g2, &b2, &clk]);
+
+    let mut cfg = Config::default();
+    cfg.use_program(&pio.load_program(&prg.program), &[&clk]);
+    let divsor = fixed::FixedU32::from_bits(2 << 8);
+    cfg.clock_divider = divsor.into();
+    cfg.shift_out = ShiftConfig {
+        auto_fill: true,
+        threshold: 32,
+        direction: ShiftDirection::Right,
+    };
+    cfg.set_out_pins(&[&r1, &g1, &b1, &r2, &g2, &b2]);
+    cfg.fifo_join = FifoJoin::TxOnly;
+
+    sm.set_config(&cfg);
+
+    sm.tx().push(W as u32 - 1);
+}
+
+fn setup_pio_task_row<'a, const H: usize, const B: usize>(
+    pio: &mut embassy_rp::pio::Common<'a, peripherals::PIO0>,
+    sm: &mut StateMachine<'a, peripherals::PIO0, 1>,
+    addra: impl PioPin,
+    addrb: impl PioPin,
+    addrc: impl PioPin,
+    addrd: impl PioPin,
+    lat: impl PioPin,
+) {
+    // Row program
+    let prg = pio_proc::pio_asm!(
+        ".side_set 1",
+        "pull           side 0b0", // Pull the height / 2 into OSR
+        "out isr, 32    side 0b0", // and move it to OSR
+        "pull           side 0b0", // Pull the color depth - 1 into OSR
+        ".wrap_target",
+        "mov x, isr     side 0b0",
+        "addr:",
+        "mov pins, ~x   side 0b0", // Set the row address
+        "mov y, osr     side 0b0",
+        "row:",
+        "wait 1 irq 4   side 0b0", // Wait until the data is clocked in
+        "nop            side 0b1",
+        "irq 6          side 0b1", // Display the latched data
+        "irq 5          side 0b0", // Clock in next row
+        "wait 1 irq 7   side 0b0", // Wait for the OE cycle to complete
+        "jmp y-- row    side 0b0",
+        "jmp x-- addr   side 0b0",
+        ".wrap",
+    );
+
+    let addra = pio.make_pio_pin(addra);
+    let addrb = pio.make_pio_pin(addrb);
+    let addrc = pio.make_pio_pin(addrc);
+    let addrd = pio.make_pio_pin(addrd);
+    let lat = pio.make_pio_pin(lat);
+
+    sm.set_pin_dirs(Direction::Out, &[&addra, &addrb, &addrc, &addrd, &lat]);
+
+    let mut cfg = Config::default();
+    cfg.use_program(&pio.load_program(&prg.program), &[&lat]);
+    let divsor = fixed::FixedU32::from_bits(1 << 8 | 1);
+    cfg.clock_divider = divsor.into();
+    cfg.set_out_pins(&[&addra, &addrb, &addrc, &addrd]);
+
+    sm.set_config(&cfg);
+
+    sm.tx().push(H as u32 / 2 - 1);
+    // Configure the color depth
+    sm.tx().push(B as u32 - 1);
+}
+
+fn setup_pio_task_oe<'a>(
+    pio: &mut embassy_rp::pio::Common<'a, peripherals::PIO0>,
+    sm: &mut StateMachine<'a, peripherals::PIO0, 2>,
+    oe: impl PioPin,
+) {
+    // Control the delay using DMA - buffer with 8 bytes specifying the length of the delays
+    // Delay program (controls OE)
+    let prg = pio_proc::pio_asm!(
+        ".side_set 1"
+        ".wrap_target",
+        "out x, 32      side 0b1",
+        "wait 1 irq 6   side 0b1",
+        "delay:",
+        "jmp x-- delay  side 0b0",
+        "irq 7          side 0b1",
+        ".wrap",
+    );
+
+    let oe = pio.make_pio_pin(oe);
+
+    sm.set_pin_dirs(Direction::Out, &[&oe]);
+
+    let mut cfg = Config::default();
+    cfg.use_program(&pio.load_program(&prg.program), &[&oe]);
+    let divsor = fixed::FixedU32::from_bits(1 << 8 | 1);
+    cfg.clock_divider = divsor.into();
+    cfg.set_out_pins(&[&oe]);
+    cfg.fifo_join = FifoJoin::TxOnly;
+
+    sm.set_config(&cfg);
+}
+
 impl<'a, CH1, const W: usize, const H: usize, const B: usize, C> Display<'a, CH1, W, H, B, C>
 where
     [(); fb_bytes(W, H, B)]: Sized,
-    CH1: ChannelIndex,
+    CH1: Channel,
     C: RgbColor,
 {
     /// Creates a new display
@@ -194,298 +320,150 @@ where
     /// * `pins`: Pins to use for the communication with the display
     /// * `pio_sms`: PIO state machines to be used to drive the display
     /// * `dma_chs`: DMA channels to be used to drive the PIO state machines
-    pub fn new<PE, SM0, SM1, SM2, CH0, CH2, CH3>(
+    pub fn new<'l, CH0, CH2, CH3>(
         buffer: &'static mut DisplayMemory<W, H, B>,
-        pins: DisplayPins<PE::PinFunction>,
-        pio_block: &mut PIO<PE>,
-        pio_sms: (
-            UninitStateMachine<(PE, SM0)>,
-            UninitStateMachine<(PE, SM1)>,
-            UninitStateMachine<(PE, SM2)>,
-        ),
-        dma_chs: (Channel<CH0>, Channel<CH1>, Channel<CH2>, Channel<CH3>),
+        r1: impl PioPin,
+        g1: impl PioPin,
+        b1: impl PioPin,
+        r2: impl PioPin,
+        g2: impl PioPin,
+        b2: impl PioPin,
+        addra: impl PioPin,
+        addrb: impl PioPin,
+        addrc: impl PioPin,
+        addrd: impl PioPin,
+        clk: impl PioPin,
+        lat: impl PioPin,
+        oe: impl PioPin,
+        dma_0: CH0,
+        dma_1: CH1,
+        dma_2: CH2,
+        dma_3: CH3,
         benchmark: bool,
         lut: &'a impl lut::Lut<B, C>,
     ) -> Self
     where
-        PE: PIOExt,
-        SM0: StateMachineIndex,
-        SM1: StateMachineIndex,
-        SM2: StateMachineIndex,
-        CH0: ChannelIndex,
-        CH2: ChannelIndex,
-        CH3: ChannelIndex,
+        CH0: Channel,
+        CH2: Channel,
+        CH3: Channel,
         C: RgbColor,
     {
-        // Setup PIO SMs
-        let (data_sm, row_sm, oe_sm) = pio_sms;
+        let pio = unsafe { peripherals::PIO0::steal() };
+        let mut pio0 = Pio::new(pio, Irqs);
+        let mut common = pio0.common;
+        let mut data_sm = pio0.sm0;
+        let mut row_sm = pio0.sm1;
+        let mut oe_sm = pio0.sm2;
 
-        // Data SM
-        let (data_sm, data_sm_tx) = {
-            let program_data = pio_proc::pio_asm!(
-                ".side_set 1",
-                "out isr, 32    side 0b0",
-                ".wrap_target",
-                "mov x isr      side 0b0",
-                // Wait for the row program to set the ADDR pins
-                "pixel:",
-                "out pins, 8    side 0b0",
-                "jmp x-- pixel  side 0b1", // clock out the pixel
-                "irq 4          side 0b0", // tell the row program to set the next row
-                "wait 1 irq 5   side 0b0",
-                ".wrap",
-            );
-            let installed = pio_block.install(&program_data.program).unwrap();
-            let (mut sm, _, mut tx) = PIOBuilder::from_program(installed)
-                .out_pins(pins.r1.id().num, 6)
-                .side_set_pin_base(pins.clk.id().num)
-                .clock_divisor_fixed_point(2, 0)
-                .out_shift_direction(ShiftDirection::Right)
-                .autopull(true)
-                .buffers(Buffers::OnlyTx)
-                .build(data_sm);
-            sm.set_pindirs([
-                (pins.r1.id().num, PinDir::Output),
-                (pins.g1.id().num, PinDir::Output),
-                (pins.b1.id().num, PinDir::Output),
-                (pins.r2.id().num, PinDir::Output),
-                (pins.g2.id().num, PinDir::Output),
-                (pins.b2.id().num, PinDir::Output),
-                (pins.clk.id().num, PinDir::Output),
-            ]);
-            // Configure the width of the screen
-            tx.write((W - 1).try_into().unwrap());
-            (sm, tx)
-        };
-
-        let row_sm = {
-            // Row program
-            let program_data = pio_proc::pio_asm!(
-                ".side_set 1",
-                "pull           side 0b0", // Pull the height / 2 into OSR
-                "out isr, 32    side 0b0", // and move it to OSR
-                "pull           side 0b0", // Pull the color depth - 1 into OSR
-                ".wrap_target",
-                "mov x, isr     side 0b0",
-                "addr:",
-                "mov pins, ~x   side 0b0", // Set the row address
-                "mov y, osr     side 0b0",
-                "row:",
-                "wait 1 irq 4   side 0b0", // Wait until the data is clocked in
-                "nop            side 0b1",
-                "irq 6          side 0b1", // Display the latched data
-                "irq 5          side 0b0", // Clock in next row
-                "wait 1 irq 7   side 0b0", // Wait for the OE cycle to complete
-                "jmp y-- row    side 0b0",
-                "jmp x-- addr   side 0b0",
-                ".wrap",
-            );
-            let installed = pio_block.install(&program_data.program).unwrap();
-            let (mut sm, _, mut tx) = PIOBuilder::from_program(installed)
-                .out_pins(pins.addra.id().num, 4)
-                .side_set_pin_base(pins.lat.id().num)
-                .clock_divisor_fixed_point(1, 1)
-                .build(row_sm);
-            sm.set_pindirs([
-                (pins.addra.id().num, PinDir::Output),
-                (pins.addrb.id().num, PinDir::Output),
-                (pins.addrc.id().num, PinDir::Output),
-                (pins.addrd.id().num, PinDir::Output),
-                (pins.lat.id().num, PinDir::Output),
-            ]);
-            // Configure the height of the screen
-            tx.write((H / 2 - 1).try_into().unwrap());
-            // Configure the color depth
-            tx.write((B - 1).try_into().unwrap());
-            sm
-        };
-
-        let (oe_sm, oe_sm_tx) = {
-            // Control the delay using DMA - buffer with 8 bytes specifying the length of the delays
-            // Delay program (controls OE)
-            let program_data = pio_proc::pio_asm!(
-                ".side_set 1"
-                ".wrap_target",
-                "out x, 32      side 0b1",
-                "wait 1 irq 6   side 0b1",
-                "delay:",
-                "jmp x-- delay  side 0b0",
-                "irq 7          side 0b1",
-                ".wrap",
-            );
-            let installed = pio_block.install(&program_data.program).unwrap();
-            let (mut sm, _, tx) = PIOBuilder::from_program(installed)
-                .side_set_pin_base(pins.oe.id().num)
-                .clock_divisor_fixed_point(1, 1)
-                .autopull(true)
-                .buffers(Buffers::OnlyTx)
-                .build(oe_sm);
-            sm.set_pindirs([(pins.oe.id().num, PinDir::Output)]);
-            (sm, tx)
-        };
+        setup_pio_task_data::<W>(&mut common, &mut data_sm, r1, g1, b1, r2, g2, b2, clk);
+        setup_pio_task_row::<H, B>(&mut common, &mut row_sm, addra, addrb, addrc, addrd, lat);
+        setup_pio_task_oe(&mut common, &mut oe_sm, oe);
 
         // Setup DMA
-        let (fb_ch, fb_loop_ch, oe_ch, oe_loop_ch) = dma_chs;
+        let (fb_ch, fb_loop_ch, oe_ch, oe_loop_ch) = (dma_0, dma_1, dma_2, dma_3);
 
         // TODO: move this to a better place
         buffer.fbptr[0] = buffer.fb0.as_ptr() as u32;
         buffer.delaysptr[0] = buffer.delays.as_ptr() as u32;
 
         // Framebuffer channel
-        fb_ch.regs().ch_al1_ctrl.write(|w| unsafe {
-            w
-                // Increase the read addr as we progress through the buffer
-                .incr_read()
-                .bit(true)
-                // Do not increase the write addr because we always want to write to PIO FIFO
-                .incr_write()
-                .bit(false)
-                // Read 32 bits at a time
-                .data_size()
-                .size_word()
-                // Setup PIO FIFO as data request trigger
-                .treq_sel()
-                .bits(data_sm_tx.dreq_value())
-                // Turn off interrupts
-                .irq_quiet()
-                .bit(!benchmark)
-                // Chain to the channel selecting the framebuffers
-                .chain_to()
-                .bits(CH1::id())
-                // Enable the channel
-                .en()
-                .bit(true)
+        fb_ch.regs().ctrl_trig().write(|w| {
+            w.set_incr_read(true);
+            w.set_incr_write(false);
+            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_treq_sel(TreqSel(0 * 8 + 0 as u8));
+            w.set_irq_quiet(!benchmark);
+            w.set_chain_to(fb_loop_ch.number());
+            w.set_en(true);
+
         });
+
+        fb_ch.regs().read_addr().write_value(buffer.fbptr[0] as u32);
         fb_ch
             .regs()
-            .ch_read_addr
-            .write(|w| unsafe { w.bits(buffer.fbptr[0]) });
+            .trans_count()
+            .write_value((fb_bytes(W, H, B) / 4) as u32);
         fb_ch
             .regs()
-            .ch_trans_count
-            .write(|w| unsafe { w.bits((fb_bytes(W, H, B) / 4) as u32) });
-        fb_ch
-            .regs()
-            .ch_write_addr
-            .write(|w| unsafe { w.bits(data_sm_tx.fifo_address() as u32) });
+            .write_addr()
+            .write_value(embassy_rp::pac::PIO0.txf(0).as_ptr() as u32);
 
-        // Framebuffer loop channel
-        fb_loop_ch.regs().ch_al1_ctrl.write(|w| unsafe {
-            w
-                // Do not increase the read addr. We always want to read a single value
-                .incr_read()
-                .bit(false)
-                // Do not increase the write addr because we always want to write to PIO FIFO
-                .incr_write()
-                .bit(false)
-                // Read 32 bits at a time
-                .data_size()
-                .size_word()
-                // No pacing
-                .treq_sel()
-                .permanent()
-                // Turn off interrupts
-                .irq_quiet()
-                .bit(true)
-                // Chain it back to the channel sending framebuffer data
-                .chain_to()
-                .bits(CH0::id())
-                // Start up the DMA channel
-                .en()
-                .bit(true)
+        //// Framebuffer loop channel
+        fb_loop_ch.regs().ctrl_trig().write(|w| {
+            w.set_incr_read(false);
+            w.set_incr_write(false);
+            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_treq_sel(TreqSel::PERMANENT);
+            w.set_irq_quiet(true);
+            w.set_chain_to(fb_ch.number());
+            w.set_en(true);
         });
+
         fb_loop_ch
             .regs()
-            .ch_read_addr
-            .write(|w| unsafe { w.bits(buffer.fbptr.as_ptr() as u32) });
+            .read_addr()
+            .write_value(buffer.fbptr.as_ptr() as u32);
+        fb_loop_ch.regs().trans_count().write_value(1 as u32);
         fb_loop_ch
             .regs()
-            .ch_trans_count
-            .write(|w| unsafe { w.bits(1) });
-        fb_loop_ch
-            .regs()
-            .ch_al2_write_addr_trig
-            .write(|w| unsafe { w.bits(fb_ch.regs().ch_read_addr.as_ptr() as u32) });
+            .al2_write_addr_trig()
+            .write_value(fb_ch.regs().read_addr().as_ptr() as u32);
 
-        // Output enable channel
-        oe_ch.regs().ch_al1_ctrl.write(|w| unsafe {
-            w
-                // Increase the read addr as we progress through the buffer
-                .incr_read()
-                .bit(true)
-                // Do not increase the write addr because we always want to write to PIO FIFO
-                .incr_write()
-                .bit(false)
-                // Read 32 bits at a time
-                .data_size()
-                .size_word()
-                // Setup PIO FIFO as data request trigger
-                .treq_sel()
-                .bits(oe_sm_tx.dreq_value())
-                // Turn off interrupts
-                .irq_quiet()
-                .bit(true)
-                // Chain to the channel selecting the framebuffers
-                .chain_to()
-                .bits(CH3::id())
-                // Enable the channel
-                .en()
-                .bit(true)
+        //// Output enable channel
+        oe_ch.regs().ctrl_trig().write(|w| {
+            w.set_incr_read(true);
+            w.set_incr_write(false);
+            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_treq_sel(TreqSel(0 * 8 + 2 as u8));
+            w.set_irq_quiet(true);
+            w.set_chain_to(oe_loop_ch.number());
+            w.set_en(true);
         });
-        oe_ch
-            .regs()
-            .ch_read_addr
-            .write(|w| unsafe { w.bits(buffer.delays.as_ptr() as u32) });
-        oe_ch
-            .regs()
-            .ch_trans_count
-            .write(|w| unsafe { w.bits(buffer.delays.len().try_into().unwrap()) });
-        oe_ch
-            .regs()
-            .ch_write_addr
-            .write(|w| unsafe { w.bits(oe_sm_tx.fifo_address() as u32) });
 
-        // Output enable loop channel
-        oe_loop_ch.regs().ch_al1_ctrl.write(|w| unsafe {
-            w
-                // Do not increase the read addr. We always want to read a single value
-                .incr_read()
-                .bit(false)
-                // Do not increase the write addr because we always want to write to PIO FIFO
-                .incr_write()
-                .bit(false)
-                // Read 32 bits at a time
-                .data_size()
-                .size_word()
-                // No pacing
-                .treq_sel()
-                .permanent()
-                // Turn off interrupts
-                .irq_quiet()
-                .bit(true)
-                // Chain it back to the channel sending framebuffer data
-                .chain_to()
-                .bits(CH2::id())
-                // Start up the DMA channel
-                .en()
-                .bit(true)
+        oe_ch
+            .regs()
+            .read_addr()
+            .write_value(buffer.delays.as_ptr() as u32);
+        oe_ch
+            .regs()
+            .trans_count()
+            .write_value(buffer.delays.len().try_into().unwrap());
+        oe_ch
+            .regs()
+            .write_addr()
+            .write_value(embassy_rp::pac::PIO0.txf(2).as_ptr() as u32);
+ 
+        //// Output enable loop channel
+        oe_loop_ch.regs().ctrl_trig().write(|w| {
+            w.set_incr_read(false);
+            w.set_incr_write(false);
+            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_treq_sel(TreqSel::PERMANENT);
+            w.set_irq_quiet(true);
+            w.set_chain_to(oe_ch.number());
+            w.set_en(true);
         });
-        oe_loop_ch
-            .regs()
-            .ch_read_addr
-            .write(|w| unsafe { w.bits(buffer.delaysptr.as_ptr() as u32) });
-        oe_loop_ch
-            .regs()
-            .ch_trans_count
-            .write(|w| unsafe { w.bits(buffer.delaysptr.len().try_into().unwrap()) });
-        oe_loop_ch
-            .regs()
-            .ch_al2_write_addr_trig
-            .write(|w| unsafe { w.bits(oe_ch.regs().ch_read_addr.as_ptr() as u32) });
 
-        data_sm.start();
-        row_sm.start();
-        oe_sm.start();
+        oe_loop_ch
+            .regs()
+            .read_addr()
+            .write_value(buffer.delaysptr.as_ptr() as u32);
+        oe_loop_ch
+            .regs()
+            .trans_count()
+            .write_value(buffer.delaysptr.len().try_into().unwrap());
+        oe_loop_ch
+            .regs()
+            .al2_write_addr_trig()
+            .write_value(oe_ch.regs().read_addr().as_ptr() as u32);
+
+        data_sm.set_enable(true);
+        row_sm.set_enable(true);
+        oe_sm.set_enable(true);
+
+        defmt::info!("data sm is enabled: {}", data_sm.is_enabled());
+        defmt::info!("row sm is enabled: {}", row_sm.is_enabled());
+        defmt::info!("oe sm is enabled: {}", oe_sm.is_enabled());
 
         Display {
             mem: buffer,
@@ -497,27 +475,27 @@ where
     }
 
     fn fb_loop_busy(&self) -> bool {
-        self.fb_loop_ch
-            .regs()
-            .ch_ctrl_trig
-            .read()
-            .busy()
-            .bit_is_set()
+        self.fb_loop_ch.regs().ctrl_trig().read().busy()
     }
 
     /// Flips the display buffers
     ///
     /// Has to be called once you have drawn something onto the currently inactive buffer.
     pub fn commit(&mut self) {
+        defmt::info!("commit");
         if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
             self.mem.fbptr[0] = self.mem.fb1.as_ptr() as u32;
-            while !self.benchmark && !self.fb_loop_busy() {}
+            //while !self.benchmark && !self.fb_loop_busy() {}
+            while !self.fb_loop_busy() {}
             self.mem.fb0[0..].fill(0);
         } else {
             self.mem.fbptr[0] = self.mem.fb0.as_ptr() as u32;
-            while !self.benchmark && !self.fb_loop_busy() {}
+            //while !self.benchmark && !self.fb_loop_busy() {}
+            while !self.fb_loop_busy() {}
             self.mem.fb1[0..].fill(0);
         }
+
+        defmt::info!("commit2");
     }
 
     /// Paints the given pixel coordinates with the given color
@@ -561,11 +539,11 @@ impl<'a, CH1, const W: usize, const H: usize, const B: usize, C> OriginDimension
     for Display<'a, CH1, W, H, B, C>
 where
     [(); fb_bytes(W, H, B)]: Sized,
-    CH1: ChannelIndex,
+    CH1: Channel,
     C: RgbColor,
 {
     fn size(&self) -> Size {
-        Size::new(W.try_into().unwrap(), H.try_into().unwrap())
+        Size::new(W as u32, H as u32)
     }
 }
 
@@ -573,7 +551,7 @@ impl<'a, CH1, const W: usize, const H: usize, const B: usize, C> DrawTarget
     for Display<'a, CH1, W, H, B, C>
 where
     [(); fb_bytes(W, H, B)]: Sized,
-    CH1: ChannelIndex,
+    CH1: Channel,
     C: RgbColor,
 {
     type Color = C;
@@ -584,7 +562,7 @@ where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x < W.try_into().unwrap() && coord.y < H.try_into().unwrap() {
+            if (coord.x as usize) < W && (coord.y as usize) < H {
                 self.set_pixel(coord.x as usize, coord.y as usize, color);
             }
         }
