@@ -30,6 +30,7 @@
 // TODO: Implement the drop trait to release DMA & PIO?
 // TODO: organize these
 use core::convert::TryInto;
+use embassy_rp::bind_interrupts;
 use embassy_rp::dma::Channel;
 use embassy_rp::pac::dma::vals::TreqSel;
 use embassy_rp::peripherals;
@@ -37,7 +38,6 @@ use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
 };
-use embassy_rp::bind_interrupts;
 use embedded_graphics::prelude::*;
 
 pub mod lut;
@@ -366,17 +366,17 @@ where
         buffer.fbptr[0] = buffer.fb0.as_ptr() as u32;
         buffer.delaysptr[0] = buffer.delays.as_ptr() as u32;
 
-        // Framebuffer channel
-        fb_ch.regs().ctrl_trig().write(|w| {
-            w.set_incr_read(true);
-            w.set_incr_write(false);
-            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            w.set_treq_sel(TreqSel(0 * 8 + 0 as u8));
-            w.set_irq_quiet(!benchmark);
-            w.set_chain_to(fb_loop_ch.number());
-            w.set_en(true);
-
-        });
+        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        w.set_incr_read(true);
+        w.set_incr_write(false);
+        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(TreqSel(0 * 8 + 0 as u8));
+        w.set_irq_quiet(!benchmark);
+        w.set_chain_to(fb_loop_ch.number());
+        w.set_en(true);
+        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        defmt::info!("w: {:?}", w);
+        fb_ch.regs().al1_ctrl().write_value(w);
 
         fb_ch.regs().read_addr().write_value(buffer.fbptr[0] as u32);
         fb_ch
@@ -388,16 +388,17 @@ where
             .write_addr()
             .write_value(embassy_rp::pac::PIO0.txf(0).as_ptr() as u32);
 
-        //// Framebuffer loop channel
-        fb_loop_ch.regs().ctrl_trig().write(|w| {
-            w.set_incr_read(false);
-            w.set_incr_write(false);
-            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            w.set_treq_sel(TreqSel::PERMANENT);
-            w.set_irq_quiet(true);
-            w.set_chain_to(fb_ch.number());
-            w.set_en(true);
-        });
+        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        w.set_incr_read(false);
+        w.set_incr_write(false);
+        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_irq_quiet(true);
+        w.set_chain_to(fb_ch.number());
+        w.set_en(true);
+        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        defmt::info!("w: {:?}", w);
+        fb_loop_ch.regs().al1_ctrl().write_value(w);
 
         fb_loop_ch
             .regs()
@@ -409,16 +410,18 @@ where
             .al2_write_addr_trig()
             .write_value(fb_ch.regs().read_addr().as_ptr() as u32);
 
-        //// Output enable channel
-        oe_ch.regs().ctrl_trig().write(|w| {
-            w.set_incr_read(true);
-            w.set_incr_write(false);
-            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            w.set_treq_sel(TreqSel(0 * 8 + 2 as u8));
-            w.set_irq_quiet(true);
-            w.set_chain_to(oe_loop_ch.number());
-            w.set_en(true);
-        });
+        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        w.set_incr_read(true);
+        w.set_incr_write(false);
+        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(TreqSel(0 * 8 + 2 as u8));
+        w.set_irq_quiet(true);
+        w.set_chain_to(oe_loop_ch.number());
+        w.set_en(true);
+        w.set_en(true);
+        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        defmt::info!("w: {:?}", w);
+        oe_ch.regs().al1_ctrl().write_value(w);
 
         oe_ch
             .regs()
@@ -432,17 +435,18 @@ where
             .regs()
             .write_addr()
             .write_value(embassy_rp::pac::PIO0.txf(2).as_ptr() as u32);
- 
-        //// Output enable loop channel
-        oe_loop_ch.regs().ctrl_trig().write(|w| {
-            w.set_incr_read(false);
-            w.set_incr_write(false);
-            w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-            w.set_treq_sel(TreqSel::PERMANENT);
-            w.set_irq_quiet(true);
-            w.set_chain_to(oe_ch.number());
-            w.set_en(true);
-        });
+
+        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        w.set_incr_read(false);
+        w.set_incr_write(false);
+        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_irq_quiet(true);
+        w.set_chain_to(oe_ch.number());
+        w.set_en(true);
+        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        defmt::info!("w: {:?}", w);
+        oe_loop_ch.regs().al1_ctrl().write_value(w);
 
         oe_loop_ch
             .regs()
@@ -461,10 +465,6 @@ where
         row_sm.set_enable(true);
         oe_sm.set_enable(true);
 
-        defmt::info!("data sm is enabled: {}", data_sm.is_enabled());
-        defmt::info!("row sm is enabled: {}", row_sm.is_enabled());
-        defmt::info!("oe sm is enabled: {}", oe_sm.is_enabled());
-
         Display {
             mem: buffer,
             fb_loop_ch,
@@ -475,7 +475,9 @@ where
     }
 
     fn fb_loop_busy(&self) -> bool {
-        self.fb_loop_ch.regs().ctrl_trig().read().busy()
+        let bool = self.fb_loop_ch.regs().ctrl_trig().read().busy();
+        //defmt::info!("busy: {:?}", bool);
+        bool
     }
 
     /// Flips the display buffers
@@ -494,7 +496,6 @@ where
             while !self.fb_loop_busy() {}
             self.mem.fb1[0..].fill(0);
         }
-
         defmt::info!("commit2");
     }
 
