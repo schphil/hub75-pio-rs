@@ -291,7 +291,6 @@ fn setup_pio_task_oe<'a>(
     cfg.use_program(&pio.load_program(&prg.program), &[&oe]);
     let divsor = fixed::FixedU32::from_bits(1 << 8 | 1);
     cfg.clock_divider = divsor.into();
-    cfg.set_out_pins(&[&oe]);
     cfg.fifo_join = FifoJoin::TxOnly;
 
     sm.set_config(&cfg);
@@ -375,7 +374,6 @@ where
         w.set_chain_to(fb_loop_ch.number());
         w.set_en(true);
         let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        defmt::info!("w: {:?}", w);
         fb_ch.regs().al1_ctrl().write_value(w);
 
         fb_ch.regs().read_addr().write_value(buffer.fbptr[0] as u32);
@@ -397,7 +395,6 @@ where
         w.set_chain_to(fb_ch.number());
         w.set_en(true);
         let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        defmt::info!("w: {:?}", w);
         fb_loop_ch.regs().al1_ctrl().write_value(w);
 
         fb_loop_ch
@@ -420,7 +417,6 @@ where
         w.set_en(true);
         w.set_en(true);
         let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        defmt::info!("w: {:?}", w);
         oe_ch.regs().al1_ctrl().write_value(w);
 
         oe_ch
@@ -445,7 +441,6 @@ where
         w.set_chain_to(oe_ch.number());
         w.set_en(true);
         let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        defmt::info!("w: {:?}", w);
         oe_loop_ch.regs().al1_ctrl().write_value(w);
 
         oe_loop_ch
@@ -484,7 +479,6 @@ where
     ///
     /// Has to be called once you have drawn something onto the currently inactive buffer.
     pub fn commit(&mut self) {
-        defmt::info!("commit");
         if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
             self.mem.fbptr[0] = self.mem.fb1.as_ptr() as u32;
             //while !self.benchmark && !self.fb_loop_busy() {}
@@ -496,7 +490,6 @@ where
             while !self.fb_loop_busy() {}
             self.mem.fb1[0..].fill(0);
         }
-        defmt::info!("commit2");
     }
 
     /// Paints the given pixel coordinates with the given color
