@@ -254,7 +254,8 @@ where
                 (pins.clk.id().num, PinDir::Output),
             ]);
             // Configure the width of the screen
-            tx.write((W - 1).try_into().unwrap());
+            tx.write((2 * W - 1).try_into().unwrap());
+
             (sm, tx)
         };
 
@@ -282,7 +283,7 @@ where
             );
             let installed = pio_block.install(&program_data.program).unwrap();
             let (mut sm, _, mut tx) = PIOBuilder::from_program(installed)
-                .out_pins(pins.addra.id().num, 4)
+                .out_pins(pins.addra.id().num, 3)
                 .side_set_pin_base(pins.lat.id().num)
                 .clock_divisor_fixed_point(1, 1)
                 .build(row_sm);
@@ -290,11 +291,11 @@ where
                 (pins.addra.id().num, PinDir::Output),
                 (pins.addrb.id().num, PinDir::Output),
                 (pins.addrc.id().num, PinDir::Output),
-                (pins.addrd.id().num, PinDir::Output),
                 (pins.lat.id().num, PinDir::Output),
             ]);
             // Configure the height of the screen
-            tx.write((H / 2 - 1).try_into().unwrap());
+            tx.write((H / 4 - 1).try_into().unwrap());
+
             // Configure the color depth
             tx.write((B - 1).try_into().unwrap());
             sm
@@ -534,14 +535,30 @@ where
         let c_r: u16 = ((c_r as f32) * (self.brightness as f32 / 255f32)) as u16;
         let c_g: u16 = ((c_g as f32) * (self.brightness as f32 / 255f32)) as u16;
         let c_b: u16 = ((c_b as f32) * (self.brightness as f32 / 255f32)) as u16;
-        let base_idx = x + ((y % (H / 2)) * W * B);
+
+        let mut base_idx = 0;
+         if h {
+             let y = y - (H / 2);
+             base_idx = x % 16 + (x / 16) * 32 + B * W * 2 * (y % 8);
+           if y > 7 {
+                 base_idx += 16;
+             }
+         } else {
+          base_idx = x % 16 + ((x / 16)) * 32 + B * W * 2 * (y % 8);
+             if y > 7 {
+                 base_idx += 16;
+             }
+         }
+
         for b in 0..B {
             // Extract the n-th bit of each component of the color and pack them
             let cr = c_r >> b & 0b1;
             let cg = c_g >> b & 0b1;
             let cb = c_b >> b & 0b1;
-            let packed_rgb = (cb << 2 | cg << 1 | cr) as u8;
-            let idx = base_idx + b * W;
+            // red and blue are swapped due to the matrix 
+            // TODO: feature for swapping red and blue
+            let packed_rgb = (cr << 2 | cg << 1 | cb) as u8;
+            let idx = base_idx + b * W * 2;
             if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
                 self.mem.fb1[idx] &= !(0b111 << shift);
                 self.mem.fb1[idx] |= packed_rgb << shift;

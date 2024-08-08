@@ -6,9 +6,14 @@ description = "A HUB75 driver for RP2040. Utilizes PIO and DMA to achieve zero C
 license = "MIT"
 
 [dependencies]
+defmt = "0.3"
+defmt-rtt = "0.4"
+embedded-graphics = "0.8"
+libm = "0.2"
 pio-proc = "0.2"
 pio = "0.2"
-libm = "0.2"
-
 rp2040-hal = "0.9"
-embedded-graphics = "0.8"
+
+
+
+
