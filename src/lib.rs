@@ -536,17 +536,17 @@ where
         let c_g: u16 = ((c_g as f32) * (self.brightness as f32 / 255f32)) as u16;
         let c_b: u16 = ((c_b as f32) * (self.brightness as f32 / 255f32)) as u16;
 
-        let mut base_idx = 0;
+         let mut base_idx = 0;
          if h {
              let y = y - (H / 2);
-             base_idx = x % 16 + (x / 16) * 32 + B * W * 2 * (y % 8);
-           if y > 7 {
-                 base_idx += 16;
+             base_idx = x % 32 + (x / 32) * 64 + B * W * 2 * (y % 8);
+           if y < 8 {
+                 base_idx += 32;
              }
          } else {
-          base_idx = x % 16 + ((x / 16)) * 32 + B * W * 2 * (y % 8);
-             if y > 7 {
-                 base_idx += 16;
+          base_idx = x % 32 + ((x / 32)) * 64 + B * W * 2 * (y % 8);
+             if y < 8 {
+                 base_idx += 32;
              }
          }
 
@@ -557,7 +557,7 @@ where
             let cb = c_b >> b & 0b1;
             // red and blue are swapped due to the matrix 
             // TODO: feature for swapping red and blue
-            let packed_rgb = (cr << 2 | cg << 1 | cb) as u8;
+            let packed_rgb = (cb << 2 | cg << 1 | cr) as u8;
             let idx = base_idx + b * W * 2;
             if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
                 self.mem.fb1[idx] &= !(0b111 << shift);
