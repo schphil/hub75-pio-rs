@@ -30,21 +30,15 @@
 // TODO: Implement the drop trait to release DMA & PIO?
 // TODO: organize these
 use core::convert::TryInto;
-use embassy_rp::bind_interrupts;
 use embassy_rp::dma::Channel;
-use embassy_rp::pac::dma::vals::TreqSel;
 use embassy_rp::peripherals;
 use embassy_rp::pio::{
-    Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
+    Config, Direction, FifoJoin, PioPin, ShiftDirection,
     StateMachine,
 };
 use embedded_graphics::prelude::*;
 
 pub mod lut;
-
-bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<peripherals::PIO0>;
-});
 
 /// Framebuffer size in bytes
 #[doc(hidden)]
@@ -200,11 +194,9 @@ fn setup_pio_task_data<'a, const W: usize>(
     cfg.use_program(&pio.load_program(&prg.program), &[&clk]);
     let divsor = fixed::FixedU32::from_bits(2 << 8);
     cfg.clock_divider = divsor.into();
-    cfg.shift_out = ShiftConfig {
-        auto_fill: true,
-        threshold: 32,
-        direction: ShiftDirection::Right,
-    };
+    cfg.shift_out.auto_fill = true;
+    cfg.shift_out.threshold = 0;
+    cfg.shift_out.direction = ShiftDirection::Right;
     cfg.set_out_pins(&[&r1, &g1, &b1, &r2, &g2, &b2]);
     cfg.fifo_join = FifoJoin::TxOnly;
 
@@ -291,6 +283,7 @@ fn setup_pio_task_oe<'a>(
     cfg.use_program(&pio.load_program(&prg.program), &[&oe]);
     let divsor = fixed::FixedU32::from_bits(1 << 8 | 1);
     cfg.clock_divider = divsor.into();
+    cfg.shift_out.auto_fill = true;
     cfg.fifo_join = FifoJoin::TxOnly;
 
     sm.set_config(&cfg);
@@ -321,6 +314,10 @@ where
     /// * `dma_chs`: DMA channels to be used to drive the PIO state machines
     pub fn new<'l, CH0, CH2, CH3>(
         buffer: &'static mut DisplayMemory<W, H, B>,
+        pio: &mut embassy_rp::pio::Common<'a, peripherals::PIO0>,
+        data_sm: &mut embassy_rp::pio::StateMachine<'a, peripherals::PIO0, 0>,
+        row_sm: &mut embassy_rp::pio::StateMachine<'a, peripherals::PIO0, 1>,
+        oe_sm: &mut embassy_rp::pio::StateMachine<'a, peripherals::PIO0, 2>,
         r1: impl PioPin,
         g1: impl PioPin,
         b1: impl PioPin,
@@ -347,16 +344,9 @@ where
         CH3: Channel,
         C: RgbColor,
     {
-        let pio = unsafe { peripherals::PIO0::steal() };
-        let mut pio0 = Pio::new(pio, Irqs);
-        let mut common = pio0.common;
-        let mut data_sm = pio0.sm0;
-        let mut row_sm = pio0.sm1;
-        let mut oe_sm = pio0.sm2;
-
-        setup_pio_task_data::<W>(&mut common, &mut data_sm, r1, g1, b1, r2, g2, b2, clk);
-        setup_pio_task_row::<H, B>(&mut common, &mut row_sm, addra, addrb, addrc, addrd, lat);
-        setup_pio_task_oe(&mut common, &mut oe_sm, oe);
+        setup_pio_task_data::<W>(pio, data_sm, r1, g1, b1, r2, g2, b2, clk);
+        setup_pio_task_row::<H, B>(pio, row_sm, addra, addrb, addrc, addrd, lat);
+        setup_pio_task_oe(pio, oe_sm, oe);
 
         // Setup DMA
         let (fb_ch, fb_loop_ch, oe_ch, oe_loop_ch) = (dma_0, dma_1, dma_2, dma_3);
@@ -365,17 +355,17 @@ where
         buffer.fbptr[0] = buffer.fb0.as_ptr() as u32;
         buffer.delaysptr[0] = buffer.delays.as_ptr() as u32;
 
-        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        let mut w: rp_pac::dma::regs::CtrlTrig = rp_pac::dma::regs::CtrlTrig(0);
         w.set_incr_read(true);
         w.set_incr_write(false);
-        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-        w.set_treq_sel(TreqSel(0 * 8 + 0 as u8));
+        w.set_data_size(rp_pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(rp_pac::dma::vals::TreqSel(0 * 8 + 0 as u8));
         w.set_irq_quiet(!benchmark);
         w.set_chain_to(fb_loop_ch.number());
         w.set_en(true);
-        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        
+        let rp_pac::dma::regs::CtrlTrig(w) = w;
         fb_ch.regs().al1_ctrl().write_value(w);
-
         fb_ch.regs().read_addr().write_value(buffer.fbptr[0] as u32);
         fb_ch
             .regs()
@@ -386,15 +376,15 @@ where
             .write_addr()
             .write_value(embassy_rp::pac::PIO0.txf(0).as_ptr() as u32);
 
-        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        let mut w: rp_pac::dma::regs::CtrlTrig = rp_pac::dma::regs::CtrlTrig(0);
         w.set_incr_read(false);
         w.set_incr_write(false);
-        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_data_size(rp_pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(rp_pac::dma::vals::TreqSel::PERMANENT);
         w.set_irq_quiet(true);
         w.set_chain_to(fb_ch.number());
         w.set_en(true);
-        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
+        let rp_pac::dma::regs::CtrlTrig(w) = w;
         fb_loop_ch.regs().al1_ctrl().write_value(w);
 
         fb_loop_ch
@@ -407,18 +397,17 @@ where
             .al2_write_addr_trig()
             .write_value(fb_ch.regs().read_addr().as_ptr() as u32);
 
-        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        let mut w: rp_pac::dma::regs::CtrlTrig = rp_pac::dma::regs::CtrlTrig(0);
         w.set_incr_read(true);
         w.set_incr_write(false);
-        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-        w.set_treq_sel(TreqSel(0 * 8 + 2 as u8));
+        w.set_data_size(rp_pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(rp_pac::dma::vals::TreqSel(0 * 8 + 2 as u8));
         w.set_irq_quiet(true);
         w.set_chain_to(oe_loop_ch.number());
         w.set_en(true);
-        w.set_en(true);
-        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        oe_ch.regs().al1_ctrl().write_value(w);
 
+        let rp_pac::dma::regs::CtrlTrig(w) = w;
+        oe_ch.regs().al1_ctrl().write_value(w);
         oe_ch
             .regs()
             .read_addr()
@@ -432,17 +421,17 @@ where
             .write_addr()
             .write_value(embassy_rp::pac::PIO0.txf(2).as_ptr() as u32);
 
-        let mut w: rp_pac::dma::regs::CtrlTrig = embassy_rp::pac::dma::regs::CtrlTrig(0);
+        let mut w: rp_pac::dma::regs::CtrlTrig = rp_pac::dma::regs::CtrlTrig(0);
         w.set_incr_read(false);
         w.set_incr_write(false);
-        w.set_data_size(embassy_rp::pac::dma::vals::DataSize::SIZE_WORD);
-        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_data_size(rp_pac::dma::vals::DataSize::SIZE_WORD);
+        w.set_treq_sel(rp_pac::dma::vals::TreqSel::PERMANENT);
         w.set_irq_quiet(true);
         w.set_chain_to(oe_ch.number());
         w.set_en(true);
-        let embassy_rp::pac::dma::regs::CtrlTrig(w) = w;
-        oe_loop_ch.regs().al1_ctrl().write_value(w);
 
+        let rp_pac::dma::regs::CtrlTrig(w) = w;
+        oe_loop_ch.regs().al1_ctrl().write_value(w);
         oe_loop_ch
             .regs()
             .read_addr()
@@ -455,6 +444,10 @@ where
             .regs()
             .al2_write_addr_trig()
             .write_value(oe_ch.regs().read_addr().as_ptr() as u32);
+        oe_loop_ch
+            .regs()
+            .al2_write_addr_trig()
+            .write_value(1342177408 as u32);
 
         data_sm.set_enable(true);
         row_sm.set_enable(true);
@@ -470,9 +463,7 @@ where
     }
 
     fn fb_loop_busy(&self) -> bool {
-        let bool = self.fb_loop_ch.regs().ctrl_trig().read().busy();
-        //defmt::info!("busy: {:?}", bool);
-        bool
+        self.fb_loop_ch.regs().ctrl_trig().read().busy()
     }
 
     /// Flips the display buffers
