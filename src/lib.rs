@@ -32,10 +32,7 @@
 use core::convert::TryInto;
 use embassy_rp::dma::Channel;
 use embassy_rp::peripherals;
-use embassy_rp::pio::{
-    Config, Direction, FifoJoin, PioPin, ShiftDirection,
-    StateMachine,
-};
+use embassy_rp::pio::{Config, Direction, FifoJoin, PioPin, ShiftDirection, StateMachine};
 use embedded_graphics::prelude::*;
 
 pub mod lut;
@@ -202,7 +199,7 @@ fn setup_pio_task_data<'a, const W: usize>(
 
     sm.set_config(&cfg);
 
-    sm.tx().push(W as u32 - 1);
+    sm.tx().push(2 * W as u32 - 1);
 }
 
 fn setup_pio_task_row<'a, const H: usize, const B: usize>(
@@ -239,20 +236,19 @@ fn setup_pio_task_row<'a, const H: usize, const B: usize>(
     let addra = pio.make_pio_pin(addra);
     let addrb = pio.make_pio_pin(addrb);
     let addrc = pio.make_pio_pin(addrc);
-    let addrd = pio.make_pio_pin(addrd);
     let lat = pio.make_pio_pin(lat);
 
-    sm.set_pin_dirs(Direction::Out, &[&addra, &addrb, &addrc, &addrd, &lat]);
+    sm.set_pin_dirs(Direction::Out, &[&addra, &addrb, &addrc, &lat]);
 
     let mut cfg = Config::default();
     cfg.use_program(&pio.load_program(&prg.program), &[&lat]);
     let divsor = fixed::FixedU32::from_bits(1 << 8 | 1);
     cfg.clock_divider = divsor.into();
-    cfg.set_out_pins(&[&addra, &addrb, &addrc, &addrd]);
+    cfg.set_out_pins(&[&addra, &addrb, &addrc]);
 
     sm.set_config(&cfg);
 
-    sm.tx().push(H as u32 / 2 - 1);
+    sm.tx().push(H as u32 / 4 - 1);
     // Configure the color depth
     sm.tx().push(B as u32 - 1);
 }
@@ -363,7 +359,7 @@ where
         w.set_irq_quiet(!benchmark);
         w.set_chain_to(fb_loop_ch.number());
         w.set_en(true);
-        
+
         let rp_pac::dma::regs::CtrlTrig(w) = w;
         fb_ch.regs().al1_ctrl().write_value(w);
         fb_ch.regs().read_addr().write_value(buffer.fbptr[0] as u32);
@@ -497,14 +493,30 @@ where
         let c_r: u16 = ((c_r as f32) * (self.brightness as f32 / 255f32)) as u16;
         let c_g: u16 = ((c_g as f32) * (self.brightness as f32 / 255f32)) as u16;
         let c_b: u16 = ((c_b as f32) * (self.brightness as f32 / 255f32)) as u16;
-        let base_idx = x + ((y % (H / 2)) * W * B);
+
+        let mut base_idx = 0;
+        if h {
+            let y = y - (H / 2);
+            base_idx = x % 32 + (x / 32) * 64 + B * W * 2 * (y % 8);
+            if y < 8 {
+                base_idx += 32;
+            }
+        } else {
+            base_idx = x % 32 + (x / 32) * 64 + B * W * 2 * (y % 8);
+            if y < 8 {
+                base_idx += 32;
+            }
+        }
+
         for b in 0..B {
             // Extract the n-th bit of each component of the color and pack them
             let cr = c_r >> b & 0b1;
             let cg = c_g >> b & 0b1;
             let cb = c_b >> b & 0b1;
+            // red and blue are swapped due to the matrix
+            // TODO: feature for swapping red and blue
             let packed_rgb = (cb << 2 | cg << 1 | cr) as u8;
-            let idx = base_idx + b * W;
+            let idx = base_idx + b * W * 2;
             if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
                 self.mem.fb1[idx] &= !(0b111 << shift);
                 self.mem.fb1[idx] |= packed_rgb << shift;
@@ -514,7 +526,6 @@ where
             }
         }
     }
-
     pub fn set_brightness(&mut self, brightness: u8) {
         self.brightness = brightness
     }
@@ -547,7 +558,7 @@ where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            if (coord.x as usize) < W && (coord.y as usize) < H {
+            if (coord.x as usize) < W && coord.x >= 0 && (coord.y as usize) < H && coord.y > 0 {
                 self.set_pixel(coord.x as usize, coord.y as usize, color);
             }
         }
