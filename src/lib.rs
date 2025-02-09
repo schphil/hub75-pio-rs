@@ -558,7 +558,7 @@ where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            if (coord.x as usize) < W && coord.x >= 0 && (coord.y as usize) < H && coord.y > 0 {
+            if (coord.x as usize) < W && coord.x >= 0 && (coord.y as usize) < H && coord.y >= 0 {
                 self.set_pixel(coord.x as usize, coord.y as usize, color);
             }
         }
