@@ -462,20 +462,31 @@ where
         self.fb_loop_ch.regs().ctrl_trig().read().busy()
     }
 
+    fn active_is_fb0(&self) -> bool {
+        self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32)
+    }
+
     /// Flips the display buffers
     ///
     /// Has to be called once you have drawn something onto the currently inactive buffer.
     pub fn commit(&mut self) {
-        if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
-            self.mem.fbptr[0] = self.mem.fb1.as_ptr() as u32;
-            //while !self.benchmark && !self.fb_loop_busy() {}
-            while !self.fb_loop_busy() {}
-            self.mem.fb0[0..].fill(0);
+        while !self.fb_loop_busy() {}
+
+        let fb0_ptr = self.mem.fb0.as_ptr() as u32;
+        let fb1_ptr = self.mem.fb1.as_ptr() as u32;
+
+        self.mem.fbptr[0] = if self.mem.fbptr[0] == fb0_ptr {
+            fb1_ptr
         } else {
-            self.mem.fbptr[0] = self.mem.fb0.as_ptr() as u32;
-            //while !self.benchmark && !self.fb_loop_busy() {}
-            while !self.fb_loop_busy() {}
-            self.mem.fb1[0..].fill(0);
+            fb0_ptr
+        };
+
+        if self.active_is_fb0() {
+            // fb0 active, fb1 inactive
+            self.mem.fb1.copy_from_slice(&self.mem.fb0);
+        } else {
+            // fb1 active, fb0 inactive
+            self.mem.fb0.copy_from_slice(&self.mem.fb1);
         }
     }
 
@@ -486,13 +497,26 @@ where
         // invert the screen
         let x = W - 1 - x;
         let y = H - 1 - y;
+
         // Half of the screen
         let h = y > (H / 2) - 1;
         let shift = if h { 3 } else { 0 };
+
         let (c_r, c_g, c_b) = self.lut.lookup(color);
-        let c_r: u16 = ((c_r as f32) * (self.brightness as f32 / 255f32)) as u16;
-        let c_g: u16 = ((c_g as f32) * (self.brightness as f32 / 255f32)) as u16;
-        let c_b: u16 = ((c_b as f32) * (self.brightness as f32 / 255f32)) as u16;
+
+        // Integer brightness scaling: out = in * brightness / 255
+        // Use u32 for the intermediate to avoid overflow and (optionally) round.
+        #[inline(always)]
+        fn scale_255(v: u16, br: u8) -> u16 {
+            let v = v as u32;
+            let br = br as u32;
+            // rounded: +127 (remove if you want truncation)
+            ((v * br + 127) / 255) as u16
+        }
+
+        let c_r: u16 = scale_255(c_r, self.brightness);
+        let c_g: u16 = scale_255(c_g, self.brightness);
+        let c_b: u16 = scale_255(c_b, self.brightness);
 
         let mut base_idx = 0;
         if h {
@@ -509,23 +533,23 @@ where
         }
 
         for b in 0..B {
-            // Extract the n-th bit of each component of the color and pack them
-            let cr = c_r >> b & 0b1;
-            let cg = c_g >> b & 0b1;
-            let cb = c_b >> b & 0b1;
-            // red and blue are swapped due to the matrix
-            // TODO: feature for swapping red and blue
+            let cr = (c_r >> b) & 0b1;
+            let cg = (c_g >> b) & 0b1;
+            let cb = (c_b >> b) & 0b1;
+
             let packed_rgb = (cb << 2 | cg << 1 | cr) as u8;
             let idx = base_idx + b * W * 2;
+
             if self.mem.fbptr[0] == (self.mem.fb0.as_ptr() as u32) {
-                self.mem.fb1[idx] &= !(0b111 << shift);
-                self.mem.fb1[idx] |= packed_rgb << shift;
+                let v = &mut self.mem.fb1[idx];
+                *v = (*v & !(0b111 << shift)) | (packed_rgb << shift);
             } else {
-                self.mem.fb0[idx] &= !(0b111 << shift);
-                self.mem.fb0[idx] |= packed_rgb << shift;
+                let v = &mut self.mem.fb0[idx];
+                *v = (*v & !(0b111 << shift)) | (packed_rgb << shift);
             }
         }
     }
+
     pub fn set_brightness(&mut self, brightness: u8) {
         self.brightness = brightness
     }
